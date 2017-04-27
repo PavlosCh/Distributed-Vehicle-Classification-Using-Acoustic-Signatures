@@ -1,0 +1,93 @@
+#include "mbed.h"
+#include "BluetoothMaster.h"
+#include <RN2483.h>
+#include "Machine_Learning.h"
+#include <iostream>
+ 
+BluetoothMaster BTSerial(D10, D2,PC_8,D14, USER_BUTTON); // D10 = TX | D2 = RX
+Machine_Learning mach_learn(PC_4); //PC_4 = mic input
+ 
+ 
+//LoRA
+DigitalOut reset(D4);
+DigitalOut led_1(LED1);
+RN2483 myLora(PA_11,PA_12);
+Serial pc(SERIAL_TX, SERIAL_RX);
+ 
+//Bluetooth
+DigitalIn ignore(PC_14); //short circuited pin
+DigitalOut enable(PC_10);
+AnalogIn mic_in(PC_4);
+ 
+void initialise_radio()
+{
+   //reset rn2483
+   reset=0;
+   wait(0.5);
+   reset=1;
+ 
+ 
+  //print out the HWEUI
+  uint8_t buf1[20];
+  pc.putc(myLora.getHWEUI(buf1,(uint8_t)20));
+ 
+ //configure keys and join the network
+ 
+  pc.printf("Trying to join TTN\n");
+  bool join_result = false;
+ 
+  //set 3 keys for connecting with Things Connected
+  uint8_t addr1[] = {0xCD,0x50,0xCD,0x96};
+  uint8_t appskey1[] = {0xFA,0x4D,0xE2,0x17,0xF2,0x36,0xEF,0xDB,0x84,0x7F,0x1E,0x86,0xC0,0xAF,0x6E,0x23};
+  uint8_t nwkskey1[] = {0x17,0xA0,0xF0,0x75,0xBB,0x0F,0xFA,0x28,0xB3,0xC4,0x96,0x02,0xDD,0xA4,0x75,0x2E};
+  join_result = myLora.initABP(addr1, appskey1, nwkskey1,false);
+ 
+  while(!join_result)
+  {
+    pc.printf("Unable to join\n");
+    wait(10); //wait 10s before retrying
+    join_result = myLora.initABP(addr1, appskey1, nwkskey1,false);
+  }
+  pc.printf("Successfully joined TTN\n");
+}
+ 
+void led_blink()
+{
+  led_1=1;
+  wait(0.5);
+  led_1=0;
+}
+ 
+void listen() //listens for threshold
+{
+    float mic_rd = mic_in.read();
+    while(mic_rd < 0.7)
+        mic_rd = mic_in.read();
+}
+ 
+int main(){
+    led_blink();
+    pc.printf("Startup\n");
+    initialise_radio();
+    enable = 1;
+    wait(1);  
+   
+    while(1){
+        //go to sleep until wake up received
+        while(BTSerial.wakeUp==0)
+            sleep();
+        printf("Back to main code\n");
+        BTSerial.wakeUp=0;
+        listen(); //detect sound above threshold
+        string vehicle = mach_learn.readSample(); //run categorisation function
+        int timeDiff_ms = BTSerial.gatherData(); //calculate vehicle speed
+        int speed = 10000/(timeDiff_ms); //assumes a 10m separation
+        printf("Speed is: %d\n", speed);
+        uint8_t message[30];
+        sprintf((char*)message,"Vehicle: %s, Speed: %d",vehicle,speed); //configure packet for LoRaWAN
+        uint8_t *msg = message;
+        printf("%c",myLora.send(1,msg, 27)); //transmit to RN2483
+        pc.printf("Sent\n");
+        wait(5);
+    }
+}

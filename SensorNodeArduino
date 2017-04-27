@@ -1,0 +1,176 @@
+#include <Event.h>
+#include <avr/interrupt.h>
+#include <avr/power.h>
+#include <avr/sleep.h>
+#include <EEPROM.h>
+ 
+#include <NeoSWSerial.h>
+#include <string.h>
+NeoSWSerial BTSerial(10, 11); // RX | TX
+const char this_node = 0x03; //arduino uses this to address itself when sending data
+const char any_slave = 0x00; //nucleo uses this to address any connected slave
+unsigned long timer1; //used to measure time between incoming and outgoing bits
+unsigned long timer2 = 0; //used to measure time between incoming analog comparator interrupts
+char ISRbuffer[50]; //used to store characters received over bluetooth
+int ISRbuf_ind = 0; //records how many characters have been recieved
+unsigned long timeDifference; //holds time difference between Arduino and Master node clocks
+int eeprom_addr = 0; //eeprom memory index
+bool send_now = false;
+unsigned long duration = 0;
+unsigned long timeStamp = 0;
+ 
+void setup()
+{  
+    pinMode(A0,INPUT); //mic input
+    pinMode(7,INPUT); //because of short circuit
+    Serial.begin(38400); //set up baud rate for PC UART
+    Serial.println("Arduino with HC-06 is ready");  
+    BTSerial.begin(38400); //set up baud rate for Bluetooth connection
+    BTSerial.attachInterrupt(ISR1); //enable interrupt for Bluetooth Rx with ISR 'ISR1'
+}
+ 
+void ISR1(uint8_t char_in){
+  BTSerial.detachInterrupt(); //disable interrupt
+  if(ISRbuf_ind==0)
+    timer1 = millis(); //reset timer to current time for new message
+  if(millis()<(timer1+700)){ //if character received within 700ms of previous one
+      ISRbuffer[ISRbuf_ind] = char_in;
+      ISRbuf_ind++;
+      if (ISRbuf_ind > 2){ //if the length is >2 then check for transmission request
+        if (ISRbuffer[1] == 0x03){ //if packet ID is '3' then indicates transmission request
+          process_buffer();
+          ISRbuf_ind = 0; //reset index for next message
+        }
+      }
+      if(ISRbuf_ind > 6){ //if the length is >6 then process buffer
+        process_buffer();
+        ISRbuf_ind = 0;
+      }
+    timer1 = millis(); //update timer with current time ready for next character
+  }
+  else
+    ISRbuf_ind = 0; //if character received too late, reset index
+  BTSerial.attachInterrupt(ISR1); //re-enable interrupt
+}
+ 
+//process received message
+void process_buffer(){
+  //extract node ID, packet ID and destination ID
+  char node_ID = ISRbuffer[0];
+  char packet_ID = ISRbuffer[1];
+  char dest_ID = ISRbuffer[2];
+  if((dest_ID == any_slave) & packet_ID == 0x02){ //if clock signal recieved
+    long setTime1 = ((ISRbuffer[3] << 8)& 0x0000ff00) + (ISRbuffer[4]&0x000000ff); //add upper two characters of clock time
+    long setTime2 = ((ISRbuffer[5] << 8)& 0x0000ff00) + (ISRbuffer[6]&0x000000ff); //add lower two characters of clock time
+    long setTime = (setTime1 << 16) + setTime2; //re-assemble clock time into 4-byte long integer
+    timeDifference = millis()- (long)setTime; //calculate difference between setTime and Arduino clock
+    Serial.print("Set time: ");
+    Serial.println((long)setTime);
+    Serial.print("Time difference: ");
+    Serial.println(timeDifference);
+    transmit_clock_ack(); //transmit a clock acknowledgement signal
+  }
+  else if ((dest_ID == any_slave) & packet_ID == 0x03){ //if data request received
+     send_now = true; //set send flag so main program will tansmit data
+     Serial.println("Send request received");
+  }
+}
+ 
+void loop() //main loop
+{
+  if(send_now == true){ //check is send flag is high
+    delay(200);
+    send_log(); //transmit data stored in EEPROM via Bluetooth
+    send_now = false; //reset send flag
+  }
+  if(analogRead(A0)>550) //check for mic input above threshold
+    measure_duration();
+}
+ 
+//extracts data from EEPROM and transmits via Bluetooth
+void send_log(){
+  BTSerial.detachInterrupt(); //disable interrupt
+  for (int i = 0; i<(eeprom_addr/8); i++){ //for each entry
+    transmit_delimeter(this_node,0x01,0x01); //first transmit the packet header
+    for (int j = 0; j<8; j++){ //then transmit each character read from the EEPROM for that entry
+      int8_t val = EEPROM.read((i*8)+j);
+      BTSerial.write(val);
+      delay(20);
+    }
+    delay(250);
+  }
+  eeprom_addr = 0; //reset address
+  BTSerial.attachInterrupt(ISR1); //re-enable interrupt
+  transmit_EoT(); //send end of transmission message
+}
+ 
+//sends wake-up signal to Master node when audio detected
+void send_wakeUp(){
+  BTSerial.detachInterrupt();
+  transmit_delimeter(this_node,0x04,0x01);
+  BTSerial.attachInterrupt(ISR1);
+}
+ 
+void measure_duration(){
+  if(millis() > timer2+100){ //if function hasn't been called within 100ms of last time
+    duration = timer2 - timeStamp; //calculate the signal duration
+    if (duration > 100){ //filter out signals less than 100ms long
+      write_to_eeprom(timeStamp-timeDifference,duration); //write sample to EEPROM compensating for time difference
+      send_wakeUp(); //send wake-up signal to Master node
+      Serial.print("Duration = ");
+      Serial.println(duration);
+      Serial.print("Time stamp = ");
+      Serial.println(timeStamp);
+      Serial.print("Time difference = ");
+      Serial.println(timeDifference);
+      Serial.println();
+    }
+      duration = 0;
+      timeStamp = millis(); //reset time stamp for new signal
+  }
+  timer2 = millis(); //set timer to current time to check against next time function is called
+}
+ 
+//write time stamp and duration to EEPROM one character at a time
+void write_to_eeprom(long timeStamp, long duration){
+  uint8_t write_buffer[8];
+  write_buffer[0] = ((timeStamp >> 24) & 0xFF);
+  write_buffer[1] = ((timeStamp >> 16) & 0xFF);
+  write_buffer[2] = ((timeStamp >> 8) & 0xFF);
+  write_buffer[3] = (timeStamp & 0xFF);
+  write_buffer[4] = ((duration >> 24) & 0xFF);
+  write_buffer[5] = ((duration >> 16) & 0xFF);
+  write_buffer[6] = ((duration >> 8) & 0xFF);
+  write_buffer[7] = (duration & 0xFF);
+  for (int i = 0; i<8; i++){
+    EEPROM.write(eeprom_addr,write_buffer[i]);
+    eeprom_addr++;
+  }
+}
+ 
+//transmit clock acknowledgement to Master node
+void transmit_clock_ack(){
+  BTSerial.detachInterrupt();
+  transmit_delimeter(this_node,0x09,0x01);
+  BTSerial.attachInterrupt(ISR1);
+}
+ 
+//transmit end-of-transmission message to Master node
+void transmit_EoT(){
+  BTSerial.detachInterrupt();
+  transmit_delimeter(this_node,0x0A,0x01);
+  BTSerial.attachInterrupt(ISR1);
+}
+ 
+//transmit header for data transmission packets to Master node
+void transmit_delimeter(char node_ID,char packet_ID, char dest_ID){
+  const uint8_t packet_length = 0x03;
+  char packet[packet_length];
+  packet[0] = node_ID;
+  packet[1] = packet_ID;
+  packet[2] = dest_ID;
+  for (int i = 0; i <packet_length;i++){
+    BTSerial.write(packet[i]);
+    delay(20);
+  }
+}
